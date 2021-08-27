@@ -89,6 +89,9 @@ const annSelectedNode = "volume.kubernetes.io/selected-node"
 // This annotation is present on K8s 1.11 release.
 const annAlphaSelectedNode = "volume.alpha.kubernetes.io/selected-node"
 
+// This annotation indicates that the volume is to be deleted explicitly
+const annRequestToDeleteVolume = "pv.kubernetes.io/request-to-delete-volume"
+
 // Finalizer for PVs so we know to clean them up
 const finalizerPV = "external-provisioner.volume.kubernetes.io/finalizer"
 
@@ -801,6 +804,23 @@ func (ctrl *ProvisionController) enqueueClaim(obj interface{}) {
 		utilruntime.HandleError(err)
 		return
 	}
+	klog.Infof("Received enqueueClaim on UID %s", uid)
+	// convert obj into PVC
+	claim, ok := obj.(*v1.PersistentVolumeClaim)
+	if !ok {
+		klog.Error("Failed to convert enqueueClaim obj into PVC")
+	} else {
+		var delTimeStampStr string
+		if claim.DeletionTimestamp != nil {
+			delTimeStampStr = claim.DeletionTimestamp.String()
+		} else {
+			delTimeStampStr = ""
+		}
+		klog.Infof("enqueueClaim UID %s\nPVC:\nName: %s\nCreationTimeStamp: %s\nDeletionTimeStamp: %s\nResourceVersion"+
+			" :%s\nFinalizers: %+v\nPhase: %s\n", uid, claim.Name, claim.CreationTimestamp.String(), delTimeStampStr, claim.ResourceVersion,
+			claim.Finalizers, claim.Status.Phase)
+	}
+
 	ctrl.claimQueue.Add(uid)
 }
 
@@ -813,6 +833,22 @@ func (ctrl *ProvisionController) enqueueVolume(obj interface{}) {
 		utilruntime.HandleError(err)
 		return
 	}
+	klog.Infof("Received enqueueVolume on key %s", key)
+	// convert obj into PV object
+	volume, ok := obj.(*v1.PersistentVolume)
+	if !ok {
+		klog.Error("Failed to convert the enqueueVolume obj into a PV")
+	} else {
+		var delTimeStampStr string
+		if volume.DeletionTimestamp != nil {
+			delTimeStampStr = volume.DeletionTimestamp.String()
+		} else {
+			delTimeStampStr = ""
+		}
+		klog.Infof("enqueueVolume key %s\nPV:\nName: %s\nCreationTimeStamp: %s\nDeletionTimeStamp: %s\nResourceVersion"+
+			" :%s\nFinalizers: %+v\nPhase: %s\n Annotations: %+v\n", key, volume.Name, volume.CreationTimestamp.String(), delTimeStampStr, volume.ResourceVersion,
+			volume.Finalizers, volume.Status.Phase, volume.Annotations)
+	}
 	ctrl.volumeQueue.Add(key)
 }
 
@@ -824,6 +860,22 @@ func (ctrl *ProvisionController) forgetVolume(obj interface{}) {
 	if key, err = cache.DeletionHandlingMetaNamespaceKeyFunc(obj); err != nil {
 		utilruntime.HandleError(err)
 		return
+	}
+	klog.Infof("Received forgetVolume on key %s, removing from queue.", key)
+	// convert obj into PV object
+	volume, ok := obj.(*v1.PersistentVolume)
+	if !ok {
+		klog.Error("Failed to convert the forgetVolume obj into a PV")
+	} else {
+		var delTimeStampStr string
+		if volume.DeletionTimestamp != nil {
+			delTimeStampStr = volume.DeletionTimestamp.String()
+		} else {
+			delTimeStampStr = ""
+		}
+		klog.Infof("forgetVolume key %s\nPV:\nName: %s\nCreationTimeStamp: %s\nDeletionTimeStamp: %s\nResourceVersion"+
+			" :%s\nFinalizers: %+v\nPhase: %s\n", key, volume.Name, volume.CreationTimestamp.String(), delTimeStampStr, volume.ResourceVersion,
+			volume.Finalizers, volume.Status.Phase)
 	}
 	ctrl.volumeQueue.Forget(key)
 	ctrl.volumeQueue.Done(key)
@@ -1128,6 +1180,8 @@ func (ctrl *ProvisionController) syncVolume(ctx context.Context, obj interface{}
 		err := ctrl.deleteVolumeOperation(ctx, volume)
 		ctrl.updateDeleteStats(volume, err, startTime)
 		return err
+	} else {
+		klog.Infof("Determined that the PV %s should not be deleted", volume.Name)
 	}
 	return nil
 }
@@ -1213,9 +1267,19 @@ func (ctrl *ProvisionController) shouldDelete(ctx context.Context, volume *v1.Pe
 	// deletion timestamp even after our successful Delete. Ignore it.
 	if ctrl.kubeVersion.AtLeast(utilversion.MustParseSemantic("v1.9.0")) {
 		if ctrl.addFinalizer && !ctrl.checkFinalizer(volume, finalizerPV) && volume.ObjectMeta.DeletionTimestamp != nil {
-			return false
+			// Check if there is a request to delete the volume explicitly.
+			if !metav1.HasAnnotation(volume.ObjectMeta, annRequestToDeleteVolume) {
+				return false
+			} else {
+				klog.Info("The volume %s was explicitly requested to be deleted from underlying storage", volume.Name)
+			}
 		} else if volume.ObjectMeta.DeletionTimestamp != nil {
-			return false
+			// Check if there is a request to delete the volume explicitly.
+			if !metav1.HasAnnotation(volume.ObjectMeta, annRequestToDeleteVolume) {
+				return false
+			} else {
+				klog.Info("The volume %s was explicitly requested to be deleted from underlying storage", volume.Name)
+			}
 		}
 	}
 
@@ -1244,7 +1308,7 @@ func (ctrl *ProvisionController) shouldDelete(ctx context.Context, volume *v1.Pe
 	if ann != ctrl.provisionerName && migratedTo != ctrl.provisionerName {
 		return false
 	}
-
+	klog.Infof("Determined PV %s is to be deleted, current phase: %s", volume.Name, volume.Status.Phase)
 	return true
 }
 
@@ -1470,7 +1534,7 @@ func (ctrl *ProvisionController) provisionClaimOperation(ctx context.Context, cl
 func (ctrl *ProvisionController) deleteVolumeOperation(ctx context.Context, volume *v1.PersistentVolume) error {
 	operation := fmt.Sprintf("delete %q", volume.Name)
 	klog.Info(logOperation(operation, "started"))
-
+	klog.Infof("deleteVolumeOperation started for the PV: %s", volume.Name)
 	err := ctrl.provisioner.Delete(ctx, volume)
 	if err != nil {
 		if ierr, ok := err.(*IgnoredError); ok {
@@ -1483,9 +1547,9 @@ func (ctrl *ProvisionController) deleteVolumeOperation(ctx context.Context, volu
 		ctrl.eventRecorder.Event(volume, v1.EventTypeWarning, "VolumeFailedDelete", err.Error())
 		return err
 	}
-
+	klog.Infof("deleteVolumeOperation succeeded for the PV: %s", volume.Name)
 	klog.Info(logOperation(operation, "volume deleted"))
-
+	klog.Infof("Attempting to delete the PV %s from the API server.", volume.Name)
 	// Delete the volume
 	if err = ctrl.client.CoreV1().PersistentVolumes().Delete(ctx, volume.Name, metav1.DeleteOptions{}); err != nil {
 		// Oops, could not delete the volume and therefore the controller will
@@ -1493,6 +1557,7 @@ func (ctrl *ProvisionController) deleteVolumeOperation(ctx context.Context, volu
 		klog.Info(logOperation(operation, "failed to delete persistentvolume: %v", err))
 		return err
 	}
+	klog.Infof("PV %s deleted from the API server.", volume.Name)
 
 	if ctrl.addFinalizer {
 		if len(volume.ObjectMeta.Finalizers) > 0 {
